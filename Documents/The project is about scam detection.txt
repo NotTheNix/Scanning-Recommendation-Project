@@ -1,0 +1,31 @@
+The project is about scam detection, The idea is about detect if the product is scam or real you can buy it, So we will Have many layers in this.
+1-First help us in choosing the easiest domain we can work with[mobiles,clothes,electronics,.....etc]
+
+2-we will use three categories of model
+-Text models [LSTM/transformer] for text processing and understanding
+-Image models[Transfer Learning] for image processing
+-ML Models[Linear regression/ Random forest] for tabular data and price prediction
+
+3-we will train them on scraped data from many websites so we need to scrap them and store them in good way to process the data
+
+4- We will use FastAPI for backed and load the models and for any requests
+
+5-We will make a UI using StreamLit
+
+6- the project also mist have the power to extract and scrap data from the passed link through the ui
+MORE EXPLAIN: the ui will contain a box for user's input he will pass a link of product he wants to know if it is scam or real to buy,So the project should be able to extract the images and Caption and the price from the passed link and then start passing them to the models to predict 
+
+7- Each category will hold two models because we are six members, each one hold a model
+
+8- We will combine them in a fusion model for the final output
+
+9- the UI Also after processing the passed Link should be able to make a small widget to recommend the user the same thing he wants but from trusted place[we will specify later the trusted list]
+
+10-We will show risk score in the ui to user with reasons or assumptions if the product he passed is scam we will give him some points why we said it may be scam
+
+11- Weighted average (simple)
+Each model gives a score 0–1. You assign weights (e.g. text 40%, image 30%, price 30%) and average them. Fast, interpretable, no extra training needed. Downside: weights are manually tuned and might not be optimal.Because the accuracy doesn't matter
+
+12- the size of data doesn't matter we don't need it big 200 250 row is much enough for the project
+
+NOTE:we talk now before starting with anything to enhance the idea, and the members will implement the model by themselves not vibecoding
