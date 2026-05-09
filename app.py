@@ -16,7 +16,9 @@ Then run UI:
 """
 
 import re
+import os
 import math
+import tempfile
 import streamlit as st
 import requests
 from urllib.parse import quote_plus
@@ -112,7 +114,7 @@ def api_scrape(url: str) -> dict:
     return r.json()
 
 
-def api_scan(product: dict, fusion: str) -> dict:
+def api_scan(product: dict, fusion: str, local_image_path: str = "") -> dict:
     """Call /scan endpoint. Returns dict or raises on failure."""
     # Clean price — backend expects float or None, scraper may return string
     raw_price = product.get("price")
@@ -128,18 +130,73 @@ def api_scan(product: dict, fusion: str) -> dict:
     except Exception:
         seller_rating = None
 
+    # Extract phone model from title if not already in product
+    phone_model = product.get("phone_model") or extract_phone_model(product.get("title", ""))
+
     payload = {
         "title":         str(product.get("title") or ""),
         "description":   str(product.get("description") or ""),
         "price":         price,
-        "phone_model":   str(product.get("phone_model") or "unknown"),
-        "image_path":    "",
+        "phone_model":   phone_model,
+        "image_path":    local_image_path,
         "seller_rating": seller_rating,
         "fusion":        fusion,
     }
     r = requests.post(f"{API_BASE}/scan", json=payload, timeout=60)
     r.raise_for_status()
     return r.json()
+
+
+# ── Phone model extractor ─────────────────────────────────────────────────────
+# Common phone brands and models to match against listing titles
+PHONE_PATTERNS = [
+    r"iphone\s*\d+\s*(?:pro\s*max|pro|plus|mini)?",
+    r"samsung\s*galaxy\s*[a-z]\d+\s*(?:ultra|plus|fe)?",
+    r"samsung\s*galaxy\s*s\d+\s*(?:ultra|plus|fe)?",
+    r"xiaomi\s*\d+\s*(?:pro|ultra)?",
+    r"redmi\s*note\s*\d+\s*(?:pro)?",
+    r"oppo\s*[a-z]\d+\s*(?:pro)?",
+    r"huawei\s*[a-z0-9\s]+",
+    r"realme\s*\d+\s*(?:pro)?",
+    r"vivo\s*[a-z0-9]+",
+    r"oneplus\s*\d+\s*(?:pro|t)?",
+]
+
+def extract_phone_model(title: str) -> str:
+    """Extract phone model name from listing title."""
+    if not title:
+        return "unknown"
+    text = title.lower()
+    for pattern in PHONE_PATTERNS:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(0).strip().title()
+    return "unknown"
+
+
+# ── Image downloader ──────────────────────────────────────────────────────────
+def download_image(image_url: str) -> str:
+    """
+    Downloads an image from a URL into a temp file.
+    Returns the local file path, or "" if download fails.
+    """
+    if not image_url or not image_url.startswith("http"):
+        return ""
+    try:
+        resp = requests.get(image_url, timeout=10, stream=True)
+        resp.raise_for_status()
+        suffix = ".jpg"
+        if "png" in image_url.lower():
+            suffix = ".png"
+        elif "webp" in image_url.lower():
+            suffix = ".webp"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        for chunk in resp.iter_content(chunk_size=8192):
+            tmp.write(chunk)
+        tmp.close()
+        return tmp.name
+    except Exception:
+        return ""
 
 
 def api_recommend() -> list:
@@ -357,17 +414,37 @@ def main():
                 st.error(f"Scraping failed: {e}")
                 return
 
+        # #4 — Handle empty title gracefully
+        title = product.get("title") or ""
+        if not title.strip():
+            st.error(
+                "Could not extract product details from this page. "
+                "The page may require a login, use JavaScript rendering, or block scrapers. "
+                "Try a direct product link from Jumia, Amazon EG, or OLX."
+            )
+            return
+
+        # Extract phone model from title
+        phone_model = extract_phone_model(title)
+
+        # #1 — Download product image for model inference
+        local_image_path = ""
+        image_url = product.get("image_url", "")
+        if image_url:
+            with st.spinner("🖼️ Downloading product image..."):
+                local_image_path = download_image(image_url)
+
         # Product card
         st.markdown("---")
         st.markdown("### 📱 Product Details")
         col1, col2 = st.columns([1, 2])
         with col1:
-            if product.get("image_url"):
-                st.image(product["image_url"], use_container_width=True)
+            if image_url:
+                st.image(image_url, use_container_width=True)
             else:
                 st.markdown("🖼️ *No image found*")
         with col2:
-            st.markdown(f"**{product.get('title') or 'Unknown Title'}**")
+            st.markdown(f"**{title}**")
             if product.get("price"):
                 st.markdown(f"💵 **Price:** {product['price']} EGP")
             else:
@@ -376,16 +453,26 @@ def main():
                 st.markdown(f"📋 {str(product['description'])[:200]}...")
             if product.get("source"):
                 st.markdown(f"🌐 **Source:** {product['source']}")
+            # #2 — Show extracted phone model
+            if phone_model != "unknown":
+                st.markdown(f"📱 **Detected Model:** {phone_model}")
 
         # ── Step 2: Scan ──
         st.markdown("---")
         st.markdown(f"### 🤖 Running AI Analysis (Fusion {fusion_choice})...")
         with st.spinner("Analyzing with text, image, and tabular models..."):
             try:
-                scan_result = api_scan(product, fusion_choice)
+                scan_result = api_scan(product, fusion_choice, local_image_path)
             except Exception as e:
                 st.error(f"Model analysis failed: {e}")
                 return
+            finally:
+                # Clean up temp image file after scan
+                if local_image_path and os.path.exists(local_image_path):
+                    try:
+                        os.remove(local_image_path)
+                    except Exception:
+                        pass
 
         # ── Step 3: Gauge ──
         st.markdown("### 📊 Risk Score")
