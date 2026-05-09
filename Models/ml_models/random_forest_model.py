@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR     = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DATA_PATH    = os.path.join(BASE_DIR, "Data", "raw_data", "listings.csv")
+DATA_PATH    = os.path.join(BASE_DIR, "Data", "raw_data", "listings(Cleaned).csv")
 PRICES_PATH  = os.path.join(BASE_DIR, "Data", "raw_data", "prices.csv")
 SAVE_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved")
 MODEL_SAVE   = os.path.join(SAVE_DIR, "random_forest_pipeline.pkl")
