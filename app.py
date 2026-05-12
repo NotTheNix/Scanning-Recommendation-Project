@@ -1,30 +1,32 @@
 """
 Scam Detection & Recommendation System — Streamlit UI
 ======================================================
-Full workflow:
-  1. User pastes a product URL
-  2. UI calls backend /scrape  → gets listing data
-  3. UI calls backend /scan    → gets scam score + breakdown
-  4. UI displays gauge, risk factors, model breakdown
-  5. UI shows trusted platform recommendations
+No backend required. Models are called directly.
 
-Run backend first:
-  cd Backend && uvicorn main:app --reload
-
-Then run UI:
+Run:
   streamlit run app.py
 """
 
 import re
 import os
+import sys
 import math
 import tempfile
+import warnings
 import streamlit as st
 import requests
+from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
 
-# ── Config ────────────────────────────────────────────────────────────────────
-API_BASE = "http://127.0.0.1:8000"
+warnings.filterwarnings("ignore")
+
+# ── Add model paths ────────────────────────────────────────────────────────────
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "Models")
+sys.path.insert(0, os.path.join(MODELS_DIR, "fusion"))
+sys.path.insert(0, os.path.join(MODELS_DIR, "text_models"))
+sys.path.insert(0, os.path.join(MODELS_DIR, "image_models"))
+sys.path.insert(0, os.path.join(MODELS_DIR, "ml_models"))
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -75,80 +77,176 @@ st.markdown("""
         font-size: 0.95rem;
     }
     .rec-button:hover { background-color: #1558b0; }
-    .breakdown-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        background-color: #1e1e2e;
-        border-radius: 8px;
-        padding: 10px 16px;
-        margin: 5px 0;
-        font-size: 0.9rem;
-    }
-    .backend-error {
-        background-color: #3a1010;
-        border: 1px solid #e74c3c;
-        border-radius: 8px;
-        padding: 14px;
-        color: #e74c3c;
-        font-size: 0.9rem;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Backend helpers ───────────────────────────────────────────────────────────
-def check_backend() -> bool:
-    """Returns True if the FastAPI backend is reachable."""
+# ── Scraper ───────────────────────────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+}
+
+def _extract_price(text: str) -> float | None:
+    """Extract first numeric value > 100 from a string as float."""
+    cleaned = text.replace(",", "").replace("\xa0", "")
+    nums = re.findall(r"\d+(?:\.\d+)?", cleaned)
+    for n in nums:
+        try:
+            v = float(n)
+            if v > 100:
+                return v
+        except Exception:
+            pass
+    return None
+
+
+def scrape_product(url: str) -> dict:
+    """
+    Scrape title, price, description, image from a product URL.
+    Supports: Jumia EG, Amazon EG, OLX/Dubizzle, Noon, generic fallback.
+    """
     try:
-        r = requests.get(f"{API_BASE}/health", timeout=3)
-        return r.status_code == 200
-    except Exception:
-        return False
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.encoding = "utf-8"
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as e:
+        return {"error": str(e)}
 
+    title = price = description = image_url = source = ""
 
-def api_scrape(url: str) -> dict:
-    """Call /scrape endpoint. Returns dict or raises on failure."""
-    r = requests.post(f"{API_BASE}/scrape", json={"url": url}, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    # ── Jumia Egypt ──
+    if "jumia.com" in url:
+        source = "Jumia Egypt"
+        # Title
+        for sel in ["h1.-fs20", "h1.-fs20.-pts.-pbxs", "h1"]:
+            el = soup.select_one(sel)
+            if el:
+                title = el.get_text(strip=True)
+                break
+        # Price — try multiple selectors
+        for sel in [".-b.-ltr.-tal.-fs24", "span.-b.-ltr", ".-fs24"]:
+            el = soup.select_one(sel)
+            if el:
+                price = _extract_price(el.get_text())
+                if price:
+                    break
+        # Description
+        el = soup.select_one(".-mhm.-pvl.-mod.article") or soup.select_one(".markup")
+        description = el.get_text(strip=True)[:300] if el else ""
+        # Image — try data-src first (lazy loaded), then src
+        for sel in ["img.-fw.-fh", "img.img-a", "img[data-src]"]:
+            el = soup.select_one(sel)
+            if el:
+                image_url = el.get("data-src") or el.get("src", "")
+                if image_url and image_url.startswith("http"):
+                    break
 
+    # ── Amazon Egypt ──
+    elif "amazon.eg" in url or "amazon.com" in url:
+        source = "Amazon Egypt"
+        el = soup.select_one("#productTitle")
+        title = el.get_text(strip=True) if el else ""
+        # Price — whole + fraction
+        whole = soup.select_one(".a-price-whole")
+        frac  = soup.select_one(".a-price-fraction")
+        if whole:
+            price_str = whole.get_text(strip=True).replace(",", "").replace(".", "")
+            if frac:
+                price_str += "." + frac.get_text(strip=True)
+            price = _extract_price(price_str)
+        if not price:
+            # Fallback: look for any .a-offscreen price
+            el = soup.select_one(".a-offscreen")
+            if el:
+                price = _extract_price(el.get_text())
+        # Description
+        el = soup.select_one("#feature-bullets")
+        description = el.get_text(strip=True)[:300] if el else ""
+        # Image
+        el = soup.select_one("#landingImage") or soup.select_one("#imgBlkFront")
+        if el:
+            image_url = el.get("data-old-hires") or el.get("src", "")
 
-def api_scan(product: dict, fusion: str, local_image_path: str = "") -> dict:
-    """Call /scan endpoint. Returns dict or raises on failure."""
-    # Clean price — backend expects float or None, scraper may return string
-    raw_price = product.get("price")
-    try:
-        price = float(str(raw_price).replace(",", "")) if raw_price else None
-    except Exception:
-        price = None
+    # ── OLX / Dubizzle ──
+    elif "olx" in url or "dubizzle" in url:
+        source = "OLX"
+        # Title
+        el = soup.select_one("h1") or soup.select_one("[data-testid='title']")
+        title = el.get_text(strip=True) if el else ""
+        # Price — try multiple selectors
+        for sel in ["[data-testid='price']", "span.price", "strong.price", "[class*='price']"]:
+            el = soup.select_one(sel)
+            if el:
+                price = _extract_price(el.get_text())
+                if price:
+                    break
+        # Description
+        el = soup.select_one("[data-testid='description']") or soup.select_one(".description")
+        description = el.get_text(strip=True)[:300] if el else ""
+        # Image — OLX uses picture/source tags with high-res images
+        el = soup.select_one("picture source[srcset]")
+        if el:
+            srcset = el.get("srcset", "")
+            # Take the last (largest) URL from srcset
+            parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
+            image_url = parts[-1] if parts else ""
+        if not image_url:
+            el = soup.select_one("img[src*='cdn']") or soup.select_one("picture img")
+            image_url = el.get("src", "") if el else ""
 
-    # Clean seller_rating similarly
-    raw_rating = product.get("seller_rating")
-    try:
-        seller_rating = float(raw_rating) if raw_rating else None
-    except Exception:
-        seller_rating = None
+    # ── Noon ──
+    elif "noon.com" in url:
+        source = "Noon"
+        el = soup.select_one("h1") or soup.select_one("[class*='productTitle']")
+        title = el.get_text(strip=True) if el else ""
+        el = soup.select_one("[class*='price']")
+        price = _extract_price(el.get_text()) if el else None
+        el = soup.select_one("img[class*='product']") or soup.select_one("img[src*='cdn']")
+        image_url = el.get("src", "") if el else ""
 
-    # Extract phone model from title if not already in product
-    phone_model = product.get("phone_model") or extract_phone_model(product.get("title", ""))
+    # ── Generic fallback ──
+    else:
+        source = "Unknown"
+        el = soup.find("h1")
+        title = el.get_text(strip=True) if el else ""
+        # og:image is most reliable for generic pages
+        og_img = soup.find("meta", property="og:image")
+        image_url = og_img["content"] if og_img else ""
+        og_desc = soup.find("meta", property="og:description")
+        description = og_desc["content"][:300] if og_desc else ""
+        # Try to find price anywhere on the page
+        price_el = soup.find(string=re.compile(r"EGP|ج\.م|£E", re.I))
+        price = _extract_price(str(price_el)) if price_el else None
 
-    payload = {
-        "title":         str(product.get("title") or ""),
-        "description":   str(product.get("description") or ""),
-        "price":         price,
-        "phone_model":   phone_model,
-        "image_path":    local_image_path,
-        "seller_rating": seller_rating,
-        "fusion":        fusion,
+    # ── Fallbacks ──
+    if not title:
+        og = soup.find("meta", property="og:title")
+        title = og["content"] if og else ""
+    if not image_url:
+        og_img = soup.find("meta", property="og:image")
+        image_url = og_img["content"] if og_img else ""
+
+    # Make sure image_url is absolute
+    if image_url and not image_url.startswith("http"):
+        image_url = ""
+
+    return {
+        "title":       title,
+        "price":       price,
+        "description": description,
+        "image_url":   image_url,
+        "source":      source,
+        "url":         url,
     }
-    r = requests.post(f"{API_BASE}/scan", json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()
 
 
 # ── Phone model extractor ─────────────────────────────────────────────────────
-# Common phone brands and models to match against listing titles
 PHONE_PATTERNS = [
     r"iphone\s*\d+\s*(?:pro\s*max|pro|plus|mini)?",
     r"samsung\s*galaxy\s*[a-z]\d+\s*(?:ultra|plus|fe)?",
@@ -163,12 +261,10 @@ PHONE_PATTERNS = [
 ]
 
 def extract_phone_model(title: str) -> str:
-    """Extract phone model name from listing title."""
     if not title:
         return "unknown"
-    text = title.lower()
     for pattern in PHONE_PATTERNS:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, title, re.IGNORECASE)
         if match:
             return match.group(0).strip().title()
     return "unknown"
@@ -176,14 +272,11 @@ def extract_phone_model(title: str) -> str:
 
 # ── Image downloader ──────────────────────────────────────────────────────────
 def download_image(image_url: str) -> str:
-    """
-    Downloads an image from a URL into a temp file.
-    Returns the local file path, or "" if download fails.
-    """
+    """Download image to temp file. Returns local path or ''."""
     if not image_url or not image_url.startswith("http"):
         return ""
     try:
-        resp = requests.get(image_url, timeout=10, stream=True)
+        resp = requests.get(image_url, headers=HEADERS, timeout=10, stream=True)
         resp.raise_for_status()
         suffix = ".jpg"
         if "png" in image_url.lower():
@@ -199,37 +292,56 @@ def download_image(image_url: str) -> str:
         return ""
 
 
-def api_recommend() -> list:
-    """Call /recommend endpoint."""
-    r = requests.get(f"{API_BASE}/recommend", timeout=5)
-    r.raise_for_status()
-    return r.json().get("recommendations", [])
+# ── Run fusion model directly ─────────────────────────────────────────────────
+@st.cache_resource
+def load_fusion_a():
+    import fusion_model as fm
+    return fm
+
+@st.cache_resource
+def load_fusion_b():
+    import fusion_model_b as fm
+    return fm
+
+def run_fusion(product: dict, fusion_choice: str, local_image_path: str) -> dict:
+    """Call the fusion model directly and return the result dict."""
+    raw_price = product.get("price")
+    try:
+        price = float(str(raw_price).replace(",", "")) if raw_price else None
+    except Exception:
+        price = None
+
+    phone_model   = extract_phone_model(product.get("title", ""))
+    fm            = load_fusion_a() if fusion_choice == "A" else load_fusion_b()
+
+    return fm.predict(
+        title         = str(product.get("title") or ""),
+        description   = str(product.get("description") or ""),
+        price         = price,
+        phone_model   = phone_model,
+        image_path    = local_image_path,
+        seller_rating = None,
+        verbose       = False,
+    )
 
 
 # ── Gauge chart ───────────────────────────────────────────────────────────────
 def render_gauge(score: float):
     pct = score * 100
     if pct < 40:
-        color     = "#2ecc71"
-        label     = "LOW RISK"
-        css_class = "safe"
+        color, label, css_class = "#2ecc71", "LOW RISK", "safe"
     elif pct < 65:
-        color     = "#f39c12"
-        label     = "MEDIUM RISK"
-        css_class = "medium"
+        color, label, css_class = "#f39c12", "MEDIUM RISK", "medium"
     else:
-        color     = "#e74c3c"
-        label     = "HIGH RISK"
-        css_class = "danger"
+        color, label, css_class = "#e74c3c", "HIGH RISK", "danger"
 
     cx, cy, r_arc = 100, 90, 70
-    start_angle   = 180
-    end_angle     = 180 + (pct / 100) * 180
-    x1 = cx + r_arc * math.cos(math.radians(start_angle))
-    y1 = cy + r_arc * math.sin(math.radians(start_angle))
+    end_angle = 180 + (pct / 100) * 180
+    x1 = cx + r_arc * math.cos(math.radians(180))
+    y1 = cy + r_arc * math.sin(math.radians(180))
     x2 = cx + r_arc * math.cos(math.radians(end_angle))
     y2 = cy + r_arc * math.sin(math.radians(end_angle))
-    large = 1 if (end_angle - start_angle) > 180 else 0
+    large = 1 if end_angle - 180 > 180 else 0
 
     svg = f"""
     <svg viewBox="0 0 200 110" xmlns="http://www.w3.org/2000/svg">
@@ -253,35 +365,21 @@ def render_gauge(score: float):
 
 # ── Risk reasons ──────────────────────────────────────────────────────────────
 def get_reasons(scan_result: dict, product: dict) -> list[tuple[str, bool]]:
-    """
-    Returns list of (reason_text, is_danger) tuples.
-    is_danger=True → red box, False → green box.
-    """
     reasons = []
     scores  = scan_result.get("scores", {})
 
-    # Text signal
     text_score = scores.get("lstm", scores.get("tfidf", 0))
     if text_score > 0.6:
         reasons.append(("🔤 Suspicious language detected in title or description", True))
-    elif text_score < 0.3:
-        reasons.append(("🔤 Listing language looks normal and trustworthy", False))
 
-    # Image signal
     img_score = scores.get("resnet50", scores.get("efficientnet", 0))
     if img_score > 0.6:
         reasons.append(("🖼️ Product image shows signs associated with scam listings", True))
-    elif img_score < 0.3:
-        reasons.append(("🖼️ Product image appears consistent with trusted listings", False))
 
-    # Tabular signal
     ml_score = scores.get("xgboost", scores.get("random_forest", 0))
     if ml_score > 0.6:
         reasons.append(("💰 Price or seller details match known scam patterns", True))
-    elif ml_score < 0.3:
-        reasons.append(("💰 Price and seller details look reasonable", False))
 
-    # Missing fields
     if not product.get("description"):
         reasons.append(("📋 No product description provided — common in scam listings", True))
     if not product.get("price"):
@@ -291,39 +389,6 @@ def get_reasons(scan_result: dict, product: dict) -> list[tuple[str, bool]]:
         reasons.append(("✅ No major red flags detected", False))
 
     return reasons
-
-
-# ── Model breakdown ───────────────────────────────────────────────────────────
-def render_breakdown(scan_result: dict):
-    scores  = scan_result.get("scores", {})
-    weights = scan_result.get("weights", {})
-
-    MODEL_LABELS = {
-        "lstm":          "LSTM (Text)",
-        "tfidf":         "TF-IDF (Text)",
-        "resnet50":      "ResNet50 (Image)",
-        "efficientnet":  "EfficientNet (Image)",
-        "xgboost":       "XGBoost (Tabular)",
-        "random_forest": "Random Forest (Tabular)",
-    }
-
-    for model_name, score in scores.items():
-        label  = MODEL_LABELS.get(model_name, model_name)
-        weight = weights.get(model_name, 0)
-        pct    = int(score * 100)
-        bar_w  = max(4, pct)
-        color  = "#2ecc71" if pct < 40 else "#f39c12" if pct < 65 else "#e74c3c"
-
-        st.markdown(f"""
-        <div class="breakdown-row">
-            <span style="width:180px">{label}</span>
-            <div style="flex:1; margin:0 12px; background:#2a2a3e; border-radius:4px; height:10px;">
-                <div style="width:{bar_w}%; background:{color}; height:10px; border-radius:4px;"></div>
-            </div>
-            <span style="width:40px; text-align:right; color:{color}">{pct}%</span>
-            <span style="width:60px; text-align:right; color:#555; font-size:0.8rem">w={int(weight*100)}%</span>
-        </div>
-        """, unsafe_allow_html=True)
 
 
 # ── Recommendations ───────────────────────────────────────────────────────────
@@ -355,21 +420,7 @@ def main():
     st.title("🔍 Scam Detection System")
     st.markdown("Paste a product listing URL to check if it's safe to buy.")
 
-    # ── Backend status ──
-    backend_ok = check_backend()
-    if not backend_ok:
-        st.markdown("""
-        <div class="backend-error">
-        ⚠️ <b>Backend is not running.</b><br>
-        Start it first:<br>
-        <code>cd Backend &amp;&amp; uvicorn main:app --reload</code>
-        </div>
-        """, unsafe_allow_html=True)
-        st.stop()
-
-    st.success("✅ Backend connected", icon="🟢")
-
-    # ── Sidebar — settings ──
+    # ── Sidebar ──
     with st.sidebar:
         st.header("⚙️ Settings")
         fusion_choice = st.radio(
@@ -378,16 +429,15 @@ def main():
             format_func=lambda x: (
                 "Sequence A — LSTM + ResNet50 + XGBoost"
                 if x == "A"
-                else "Sequence B — TF-IDF + EfficientNet + Random Forest"
+                else "Sequence B — TF-IDF + EfficientNet + RF"
             ),
             index=0,
-            help="Choose which combination of models to use for analysis.",
         )
         st.markdown("---")
         st.markdown("**Sequence A** (recommended)")
         st.markdown("• LSTM 40% · ResNet50 35% · XGBoost 25%")
         st.markdown("**Sequence B**")
-        st.markdown("• TF-IDF 40% · EfficientNet 35% · Random Forest 25%")
+        st.markdown("• TF-IDF 40% · EfficientNet 35% · RF 25%")
 
     # ── URL input ──
     url = st.text_input(
@@ -407,34 +457,30 @@ def main():
             return
 
         # ── Step 1: Scrape ──
-        with st.spinner("🔎 Fetching product details from URL..."):
-            try:
-                product = api_scrape(url)
-            except Exception as e:
-                st.error(f"Scraping failed: {e}")
-                return
+        with st.spinner("🔎 Fetching product details..."):
+            product = scrape_product(url)
 
-        # #4 — Handle empty title gracefully
-        title = product.get("title") or ""
-        if not title.strip():
+        if "error" in product:
+            st.error(f"Could not fetch the page: {product['error']}")
+            return
+
+        title = product.get("title", "").strip()
+        if not title:
             st.error(
                 "Could not extract product details from this page. "
-                "The page may require a login, use JavaScript rendering, or block scrapers. "
+                "The page may require login, use JavaScript, or block scrapers. "
                 "Try a direct product link from Jumia, Amazon EG, or OLX."
             )
             return
 
-        # Extract phone model from title
-        phone_model = extract_phone_model(title)
-
-        # #1 — Download product image for model inference
+        # ── Step 2: Download image ──
+        image_url        = product.get("image_url", "")
         local_image_path = ""
-        image_url = product.get("image_url", "")
         if image_url:
             with st.spinner("🖼️ Downloading product image..."):
                 local_image_path = download_image(image_url)
 
-        # Product card
+        # ── Product card ──
         st.markdown("---")
         st.markdown("### 📱 Product Details")
         col1, col2 = st.columns([1, 2])
@@ -446,59 +492,55 @@ def main():
         with col2:
             st.markdown(f"**{title}**")
             if product.get("price"):
-                st.markdown(f"💵 **Price:** {product['price']} EGP")
+                st.markdown(f"💵 **Price:** {int(product['price']):,} EGP")
             else:
                 st.markdown("💵 **Price:** Not found")
             if product.get("description"):
-                st.markdown(f"📋 {str(product['description'])[:200]}...")
+                st.markdown(f"📋 {product['description'][:200]}...")
             if product.get("source"):
                 st.markdown(f"🌐 **Source:** {product['source']}")
-            # #2 — Show extracted phone model
+            phone_model = extract_phone_model(title)
             if phone_model != "unknown":
                 st.markdown(f"📱 **Detected Model:** {phone_model}")
 
-        # ── Step 2: Scan ──
+        # ── Step 3: Run models ──
         st.markdown("---")
         st.markdown(f"### 🤖 Running AI Analysis (Fusion {fusion_choice})...")
         with st.spinner("Analyzing with text, image, and tabular models..."):
             try:
-                scan_result = api_scan(product, fusion_choice, local_image_path)
+                scan_result = run_fusion(product, fusion_choice, local_image_path)
             except Exception as e:
                 st.error(f"Model analysis failed: {e}")
                 return
             finally:
-                # Clean up temp image file after scan
                 if local_image_path and os.path.exists(local_image_path):
                     try:
                         os.remove(local_image_path)
                     except Exception:
                         pass
 
-        # ── Step 3: Gauge ──
+        # ── Step 4: Gauge ──
         st.markdown("### 📊 Risk Score")
         render_gauge(scan_result["final_score"])
 
-        # Verdict badge
-        verdict    = scan_result["verdict"]
-        risk_level = scan_result["risk_level"]
+        verdict = scan_result["verdict"]
         verdict_color = {"Trusted": "#2ecc71", "Suspicious": "#f39c12", "Scam": "#e74c3c"}.get(verdict, "#888")
         st.markdown(
-            f'<div style="text-align:center; font-size:1.3rem; font-weight:bold; color:{verdict_color}; margin:8px 0">'
-            f'Verdict: {verdict}</div>',
+            f'<div style="text-align:center; font-size:1.3rem; font-weight:bold;'
+            f' color:{verdict_color}; margin:8px 0">Verdict: {verdict}</div>',
             unsafe_allow_html=True,
         )
 
-        # ── Step 4: Risk reasons (only shown when score > 59%) ──
+        # ── Step 5: Risk factors (only if score > 59%) ──
         if scan_result["final_score"] > 0.59:
             st.markdown("### ⚠️ Risk Factors")
-            reasons = get_reasons(scan_result, product)
-            for reason_text, is_danger in reasons:
+            for reason_text, is_danger in get_reasons(scan_result, product):
                 css = "reason-box" if is_danger else "ok-box"
                 st.markdown(f'<div class="{css}">{reason_text}</div>', unsafe_allow_html=True)
 
         # ── Step 6: Recommendations ──
         st.markdown("---")
-        render_recommendations(product.get("title", ""))
+        render_recommendations(title)
 
     # Footer
     st.markdown("---")
